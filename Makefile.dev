@@ -1,0 +1,75 @@
+ENV_FILE ?= .env
+
+ifneq (,$(wildcard $(ENV_FILE)))
+include $(ENV_FILE)
+endif
+
+# Database configuration
+DB_CONTAINER_NAME := phone-encryption-postgres
+DOCKER_VOLUME_NAME := phone-encryption-postgres-data
+DB_IMAGE := postgres:17
+DB_PORT_CONTAINER := 5432
+
+#Create a named volume if it doesn't exist
+create_volume:
+	docker volume inspect $(DOCKER_VOLUME_NAME) > /dev/null 2>&1 || docker volume create $(DOCKER_VOLUME_NAME)
+
+delete_volume:
+	@echo "==> Stopping Postgres container if it is running..."
+	-docker stop $(DB_CONTAINER_NAME) || true
+	@echo "==> Removing existing Postgres container if it exists..."
+	-docker rm $(DB_CONTAINER_NAME) || true
+	@echo "==> Removing volume..."
+	docker volume rm $(DOCKER_VOLUME_NAME) || true
+
+postgres: create_volume
+	docker run --name $(DB_CONTAINER_NAME) \
+        -p 54321:$(DB_PORT_CONTAINER) \
+        -e POSTGRES_USER=$(DB_USER) \
+        -e POSTGRES_PASSWORD=$(DB_PASSWORD) \
+        -v $(DOCKER_VOLUME_NAME):/var/lib/postgresql/data \
+        -d $(DB_IMAGE)
+
+createdb:
+	docker exec -it $(DB_CONTAINER_NAME) createdb "$(DB_NAME)" --username=$(DB_USER) --owner=$(DB_USER)
+
+dropdb:
+	docker exec -it $(DB_CONTAINER_NAME) dropdb "$(DB_NAME)"
+
+install_air:
+	@echo "==> Installing air..."
+	go install github.com/cosmtrek/air@latest
+	@echo "$(shell air -v)"
+
+air:
+	@echo "==> Killing the server if it is running...$(PORT)"
+	@if lsof -t -i :$(PORT) > /dev/null; then \
+		kill -9 $$(lsof -t -i :$(PORT)); \
+		echo "Server on port $(PORT) killed."; \
+	else \
+		echo "No server running on port $(PORT)."; \
+	fi
+	@echo "==> Starting the server with air..."
+	air
+
+reset_db:
+	@echo "==> Resetting development environment..."
+	$(MAKE) -f Makefile.dev delete_volume
+	@echo "==> Creating volume if it doesn't exist..."
+	$(MAKE) -f Makefile.dev create_volume
+
+	@echo "==> Recreating the Postgres container..."
+	$(MAKE) -f Makefile.dev postgres
+
+	@echo "==> Waiting a few seconds for Postgres to start..."
+	@for i in {5..1}; do \
+		echo "Sleeping $$i seconds..."; \
+		sleep 1; \
+	done
+
+	@echo "==> Creating the database..."
+	$(MAKE) -f Makefile.dev createdb
+
+	@echo "==> Development environment has been reset!"
+
+.PHONY: postgres createdb dropdb reset_db create_volume delete_volume install_air air 
