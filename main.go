@@ -13,6 +13,8 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/joho/godotenv"
+	"golang.org/x/oauth2/google"
+	"google.golang.org/api/option"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 )
@@ -24,11 +26,44 @@ type PhoneNumber struct {
 	UpdatedAt     time.Time `json:"updated_at"`
 }
 
+type KMSClient struct {
+	Client  *kms.KeyManagementClient
+	KeyPath string
+}
+
 var (
-	db        *gorm.DB
-	kmsClient *kms.KeyManagementClient
-	keyPath   string
+	db *gorm.DB
+	// Map to store different KMS clients for different purposes
+	kmsClients = make(map[string]*KMSClient)
 )
+
+func initKMSClient(ctx context.Context, serviceAccountPath, keyPath, clientName string) error {
+	// Read the service account key file
+	serviceAccountJSON, err := os.ReadFile(serviceAccountPath)
+	if err != nil {
+		return fmt.Errorf("failed to read service account file for %s: %v", clientName, err)
+	}
+
+	// Create credentials from the JSON content
+	credentials, err := google.CredentialsFromJSON(ctx, serviceAccountJSON, "https://www.googleapis.com/auth/cloudkms")
+	if err != nil {
+		return fmt.Errorf("failed to load credentials for %s: %v", clientName, err)
+	}
+
+	// Create KMS client
+	client, err := kms.NewKeyManagementClient(ctx, option.WithCredentials(credentials))
+	if err != nil {
+		return fmt.Errorf("failed to create KMS client for %s: %v", clientName, err)
+	}
+
+	// Store the client and key path
+	kmsClients[clientName] = &KMSClient{
+		Client:  client,
+		KeyPath: keyPath,
+	}
+
+	return nil
+}
 
 func init() {
 	if err := godotenv.Load(); err != nil {
@@ -50,16 +85,17 @@ func init() {
 		log.Fatalf("Failed to connect to database: %v", err)
 	}
 
-	// Initialize GCP KMS client
+	// Initialize KMS clients for different purposes
 	ctx := context.Background()
-	kmsClient, err = kms.NewKeyManagementClient(ctx)
-	if err != nil {
-		log.Fatalf("Failed to create KMS client: %v", err)
-	}
 
-	keyPath = os.Getenv("KMS_KEY_PATH")
-	if keyPath == "" {
-		log.Fatal("KMS_KEY_PATH environment variable is required")
+	// Initialize phone number encryption KMS client
+	if err := initKMSClient(
+		ctx,
+		os.Getenv("PHONE_ENCRYPTION_SERVICE_ACCOUNT_PATH"),
+		os.Getenv("PHONE_ENCRYPTION_KEY_PATH"),
+		"phone_encryption",
+	); err != nil {
+		log.Fatal(err)
 	}
 
 	// Auto-migrate database
@@ -70,14 +106,18 @@ func init() {
 
 func encryptData(plaintext []byte) (string, error) {
 	ctx := context.Background()
+	kmsClient := kmsClients["phone_encryption"]
+	if kmsClient == nil {
+		return "", fmt.Errorf("phone encryption KMS client not initialized")
+	}
 
 	// Encrypt the data
 	req := &kmspb.EncryptRequest{
-		Name:      keyPath,
+		Name:      kmsClient.KeyPath,
 		Plaintext: plaintext,
 	}
 
-	resp, err := kmsClient.Encrypt(ctx, req)
+	resp, err := kmsClient.Client.Encrypt(ctx, req)
 	if err != nil {
 		return "", fmt.Errorf("failed to encrypt data: %v", err)
 	}
@@ -88,6 +128,10 @@ func encryptData(plaintext []byte) (string, error) {
 
 func decryptData(encryptedData string) (string, error) {
 	ctx := context.Background()
+	kmsClient := kmsClients["phone_encryption"]
+	if kmsClient == nil {
+		return "", fmt.Errorf("phone encryption KMS client not initialized")
+	}
 
 	// Decode base64 encrypted data
 	ciphertext, err := base64.StdEncoding.DecodeString(encryptedData)
@@ -97,11 +141,11 @@ func decryptData(encryptedData string) (string, error) {
 
 	// Decrypt the data
 	req := &kmspb.DecryptRequest{
-		Name:       keyPath,
+		Name:       kmsClient.KeyPath,
 		Ciphertext: ciphertext,
 	}
 
-	resp, err := kmsClient.Decrypt(ctx, req)
+	resp, err := kmsClient.Client.Decrypt(ctx, req)
 	if err != nil {
 		return "", fmt.Errorf("failed to decrypt data: %v", err)
 	}
